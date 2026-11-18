@@ -34,9 +34,19 @@
     return m.toFixed(2) + 'x';
   }
   // The model in one function, the same arithmetic main.ts runs: TVL x multiple x 0.8 x growth x
-  // maturity, in the same order, so the page's number is the board's number to the dollar.
+  // maturity x breadth, in the same order, so the page's number is the board's number to the dollar.
   function impliedOf(row) {
-    return Math.max(1, Math.round(row.tvl_usd * row.multiple * DATA.model.pretoken_discount * row.growth_multiplier * row.maturity_multiplier));
+    return Math.max(1, Math.round(row.tvl_usd * row.multiple * DATA.model.pretoken_discount * row.growth_multiplier * row.maturity_multiplier * row.breadth_multiplier));
+  }
+  // The band the page shows for a row, from the same quartile ratios main.ts used: low and high
+  // bracket the point by construction, so a band that does not bracket it means stale data.
+  function bandOf(row) {
+    return { low: row.implied_low_usd, high: row.implied_high_usd, ratio: row.implied_low_usd > 0 ? row.implied_high_usd / row.implied_low_usd : 1 };
+  }
+  function confidenceLabel(ratio) {
+    if (ratio <= 2) return 'narrow band: the comparables mostly agree';
+    if (ratio <= 4) return 'medium band: the comparables disagree somewhat';
+    return 'wide band: the market has not agreed what this kind of protocol is worth';
   }
 
   function el(tag, attrs) {
@@ -69,6 +79,11 @@
     if (p.tvl_usd >= 1e8) return 100;
     return 50;
   }
+  function capitalScale(bandRatio) {
+    if (bandRatio > 6) return 0.5;
+    if (bandRatio > 3) return 0.75;
+    return 1;
+  }
   function holdDaysFor(age) {
     if (age === null || age === undefined) return 30;
     if (age < 180) return 60;
@@ -98,15 +113,19 @@
   }
   function farmSteps(p) {
     var chain = chainOf(p);
-    var capital = capitalFor(p);
+    var band = bandOf(p);
+    var capital = Math.round(capitalFor(p) * capitalScale(band.ratio));
     var hold = holdDaysFor(p.age_days);
     var young = p.age_days !== null && p.age_days !== undefined && p.age_days < 180;
+    var sizedDown = capitalScale(band.ratio) < 1;
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
       { text: young ? 'Repeat a qualifying action in week 2 and week 4, such as a deposit, a borrow, a swap or a vote, so the young protocol sees a pattern, not one visit.' : 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes; if it has no points page yet, the position still counts for a future snapshot.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: sizedDown ? "This protocol's value band is wide, so the position is sized down on purpose: the comparables disagree by a factor of " + band.ratio.toFixed(1) + ', and a smaller bet is the honest answer to that disagreement.' : "This protocol's value band is narrow, so the comparables mostly agree and the position is full size.", cost: 'nothing but the sizing decision', time: '5 minutes' },
+      { text: 'Unwind in two parts: take half the position out once the token launches and a market exists, and leave the rest for a second snapshot so a later distribution still sees the position.', cost: 'about $4 of gas to exit', time: '15 minutes to unwind' },
       { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
     ].map(stepText);
   }
@@ -162,6 +181,7 @@
       else if (key === 'age') { av = a.age_days === null || a.age_days === undefined ? Infinity : a.age_days; bv = b.age_days === null || b.age_days === undefined ? Infinity : b.age_days; }
       else if (key === 'multiple') { av = a.multiple === undefined ? -Infinity : a.multiple; bv = b.multiple === undefined ? -Infinity : b.multiple; }
       else if (key === 'mcap') { av = a.mcap_usd === null ? -Infinity : a.mcap_usd; bv = b.mcap_usd === null ? -Infinity : b.mcap_usd; }
+      else if (key === 'confidence') { av = a.implied_low_usd === undefined || a.implied_low_usd <= 0 ? Infinity : a.implied_high_usd / a.implied_low_usd; bv = b.implied_low_usd === undefined || b.implied_low_usd <= 0 ? Infinity : b.implied_high_usd / b.implied_low_usd; }
       else { av = a.implied_value_usd === undefined ? a.tvl_usd : a.implied_value_usd; bv = b.implied_value_usd === undefined ? b.tvl_usd : b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -231,7 +251,7 @@
 
   function sortHeader(key, label) {
     return el('th', { scope: 'col' },
-      el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = -1; } render(); } },
+      el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = key === 'confidence' ? 1 : -1; } render(); } },
         label,
         state.sort === key ? el('span', { 'aria-hidden': 'true', text: state.dir < 0 ? ' v' : ' ^' }) : null
       )
@@ -274,8 +294,10 @@
         el('td', { class: 'num', text: fmtMult(r.multiple) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
-          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
+          el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) }),
+          el('span', { class: 'sub', text: fmtUsd(r.implied_low_usd) + ' – ' + fmtUsd(r.implied_high_usd) })
         )),
+        el('td', { class: 'num', text: (r.implied_low_usd > 0 ? (r.implied_high_usd / r.implied_low_usd).toFixed(1) + 'x' : 'n/a') }),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -292,6 +314,7 @@
             sortHeader('age', 'Age'),
             sortHeader('multiple', 'Multiple'),
             sortHeader('implied', 'Implied value'),
+            sortHeader('confidence', 'Band'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -361,11 +384,12 @@
     });
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The multiple is not a guess: it is the median market-cap-to-TVL ratio of the live protocols in the same category, so the market itself sets the price of a dollar of TVL. A category with fewer than three live protocols uses the global median. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The multiple is not a guess: it is the median market-cap-to-TVL ratio of the live protocols in the same category, pulled toward the global median where the category has few comparables, so the market itself sets the price of a dollar of TVL. A category with fewer than three live protocols uses the global median. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        el('b', { text: 'implied = round( tvl_usd x multiple x 0.80 x (1 + clamp(change_7d, -50, 100) / 100 x 0.60) x (0.60 + min(age_days, 1095) / 1095 x 0.40) )' })
+        el('b', { text: 'implied = round( tvl_usd x multiple x 0.80 x (1 + clamp(change_7d, -50, 100) / 100 x 0.60) x (0.60 + min(age_days, 1095) / 1095 x 0.40) x (1 + 0.03 x (min(chains, 4) - 1)) )' })
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The 0.80 is a pre-token discount: a token not yet issued carries issuance risk, so it is worth less than the same TVL with a live token. Wrapped, staked and bridged products are set aside, and live-token protocols are shown with their market caps.' }),
+      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. The 0.80 is a pre-token discount: a token not yet issued carries issuance risk, so it is worth less than the same TVL with a live token. Chain breadth adds 3% per chain up to four: a protocol on several chains is worth more than the same TVL on one. Wrapped, staked and bridged products are set aside, and live-token protocols are shown with their market caps.' }),
+      el('p', { class: 'sub', text: 'The multiple is shrunk before it is used: with n live comparables and a prior weight of ' + m.shrink_prior + ', multiple = (n x category median + ' + m.shrink_prior + ' x global median) / (n + ' + m.shrink_prior + '). A category with fifteen comparables barely moves; a category with three moves halfway to the market. Every row also carries a plausible range, the same estimate at the first and third quartiles of its category ratios, so a wide band means the comparables disagree and the farm plan sizes its capital down.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'mult-table' },
           el('thead', null, el('tr', null, el('th', { text: 'Category' }), el('th', { text: 'Multiple' }), el('th', { text: 'Live comps' }), el('th', { text: 'Source' }))),
@@ -419,8 +443,9 @@
       return;
     }
     var recomputed = impliedOf(row);
+    var band = bandOf(row);
     var multNote = row.multiple_source === 'category'
-      ? 'median of ' + row.multiple_n + ' live ' + (row.category || 'Other') + ' protocols'
+      ? 'median of ' + row.multiple_n + ' live ' + (row.category || 'Other') + ' protocols, shrunk toward the global median'
       : 'global median of ' + row.multiple_n + ' live protocols';
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
@@ -428,13 +453,16 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Market multiple' }), el('b', { class: 'num', text: fmtMult(row.multiple) })),
         el('div', null, el('span', { text: 'Multiple source' }), el('b', { class: 'num', text: multNote })),
+        el('div', null, el('span', { text: 'Multiple band (Q1 – Q3)' }), el('b', { class: 'num', text: fmtMult(row.multiple_q1) + ' – ' + fmtMult(row.multiple_q3) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: row.growth_multiplier.toFixed(4) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: row.maturity_multiplier.toFixed(4) })),
-        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: 'Chain breadth' }), el('b', { class: 'num', text: row.breadth_multiplier.toFixed(2) + 'x on ' + row.chains.length + (row.chains.length === 1 ? ' chain' : ' chains') })),
+        el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
+        el('div', { class: 'total' }, el('span', { text: 'Plausible range' }), el('b', { class: 'num', text: fmtUsd(row.implied_low_usd) + ' – ' + fmtUsd(row.implied_high_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' The range is the same estimate at the first and third quartiles of the category comparables, a ' + band.ratio.toFixed(1) + 'x band — ' + confidenceLabel(band.ratio) + '. This is an estimate, not a price.' })
     ));
     var steps = farmSteps(row);
     dialog.appendChild(el('section', { class: 'detail-section' },

@@ -101,7 +101,8 @@ tbody tr[data-selected="true"] { background: #16283f; }
 .neg { color: var(--negative); }
 .bar { width: 110px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); }
-.implied { display: flex; align-items: center; gap: var(--step-2); }
+.implied { display: flex; flex-wrap: wrap; align-items: center; gap: 2px var(--step-2); }
+.implied .sub { flex-basis: 100%; white-space: nowrap; }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .status.live::before { background: var(--blue); }

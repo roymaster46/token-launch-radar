@@ -1,4 +1,4 @@
-// Token Radar's model, radar-2: one snapshot in, one ranked board out.
+// Token Radar's model, radar-3: one snapshot in, one ranked board out.
 //
 // The board ranks every pre-token protocol the house rule allows: the 40 watchlist slugs, plus every
 // other pre-token protocol below the floor that is not a wrapped, staked or bridged product of a token
@@ -11,17 +11,35 @@
 // prices live tokens against their TVL, so the model takes the median market-cap-to-TVL ratio of the
 // live protocols in the same category as the multiple, falling back to the global median where a
 // category has fewer than three live protocols. A token that does not exist yet carries issuance risk,
-// so the multiple is discounted 20%. Then growth and maturity adjust it:
+// so the multiple is discounted 20%. Then growth, maturity and chain breadth adjust it. Three things
+// changed since radar-2, and each one is visible in the row it scores:
 //
-//   multiple   = median(mcap_usd / tvl_usd) over live protocols in the category (>= 3), else the
-//                global median; clamped to [0.05, 1.5]
+//   * Shrinkage. A category median from three live protocols is a fragile number, so the category
+//     median is pulled toward the global median before it is used: with n live comparables and a
+//     prior weight k, multiple = (n x category median + k x global median) / (n + k). A category
+//     with many comparables barely moves; a category with three moves halfway to the market.
+//   * Chain breadth. A protocol live on several chains is worth more than the same TVL on one chain:
+//     every chain past the first, up to four chains counted, adds 3% to the value, so breadth runs
+//     from 1.00 (one chain) to 1.09 (four or more chains).
+//   * Confidence interval. The comparables in a category disagree wildly — the interquartile spread
+//     of the ratios is often several times the median — so a point estimate alone misleads. Every
+//     row now carries the implied value at the category's first and third quartiles, scaled from the
+//     same point estimate, so the band always brackets the point: low <= implied <= high. A wide
+//     band means the market has not agreed what this kind of protocol is worth, and the farm plan
+//     sizes its capital down when the band is wide.
+//
+//   multiple   = shrink(category median, global median) over live protocols in the category (>= 3),
+//                else the global median; clamped to [0.05, 1.5]
 //   growth     = clamp(change_7d, -50, 100) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(tvl_usd x multiple x 0.8 x growthMult x maturity))
+//   breadth    = 1 + 0.03 x min(chains, 4)
+//   implied    = max(1, round(tvl_usd x multiple x 0.8 x growthMult x maturity x breadth))
+//   low, high  = implied scaled by (quartile1 / median) and (quartile3 / median) of the same
+//                category's ratios, so the band brackets the point estimate by construction
 //
 // No protocol name is ever special-cased: the same function scores every row, and the dashboard shows
-// each row's multiple with the live comparables it came from.
+// each row's multiple with the live comparables it came from, and the width of its band.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -59,6 +77,9 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   min_comparables: number;
+  shrink_prior: number;
+  breadth_weight: number;
+  breadth_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -73,10 +94,13 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.05,
   multiple_cap: 1.5,
   min_comparables: 3,
+  shrink_prior: 3,
+  breadth_weight: 0.03,
+  breadth_cap: 4,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -107,13 +131,18 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   model: {
     multiple: number;
     multiple_n: number;
     multiple_source: 'category' | 'global';
+    multiple_q1: number;
+    multiple_q3: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    breadth_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -132,11 +161,16 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
   multiple: number;
   multiple_n: number;
   multiple_source: 'category' | 'global';
+  multiple_q1: number;
+  multiple_q3: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  breadth_multiplier: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -161,12 +195,16 @@ export interface SetAsideRow {
   reason: string;
 }
 
-/** One category's market multiple, for the model panel. */
+/** One category's market multiple, for the model panel: the shrunk median and the quartile band of the
+ *  live ratios it came from, so the dashboard can show how much the comparables disagree. */
 export interface CategoryMultiple {
   category: string;
   multiple: number;
   n: number;
   source: 'category' | 'global';
+  q1: number;
+  q3: number;
+  raw_median: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, the set-aside set, and the model. */
@@ -220,6 +258,19 @@ export function median(values: number[]): number | null {
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
+/** The q-th quantile of a list of numbers by linear interpolation, or null when empty. The band a
+ *  row carries is the 25th and 75th percentiles of its category's live ratios: half the comparables
+ *  sit inside it, so it says how much the market disagrees about this kind of protocol. */
+export function quartile(values: number[], q: number): number | null {
+  if (values.length === 0) return null;
+  if (values.length === 1) return values[0]!;
+  const sorted = [...values].sort((a, b) => a - b);
+  const at = (sorted.length - 1) * q;
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+}
+
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
@@ -255,7 +306,12 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The market multiples: one per category with live comparables, plus the global fallback. */
+/** The market multiples: one per category with live comparables, plus the global fallback. A category
+ *  median is shrunk toward the global median before it is used: with n live comparables and the prior
+ *  weight k, the multiple is (n x category median + k x global median) / (n + k). A category with
+ *  fifteen comparables barely moves; a category with three moves halfway to the market, because a
+ *  median of three ratios is a fragile number. The quartiles travel with the multiple, unshrunk, so
+ *  the band a row carries still shows the raw disagreement of its own category. */
 export function buildMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): { byCategory: Map<string, CategoryMultiple>; global: CategoryMultiple } {
   const live = snapshot.protocols.filter(
     (p) => !isPreToken(p) && p.category !== 'CEX' && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0,
@@ -267,14 +323,34 @@ export function buildMultiples(snapshot: Snapshot, model: ModelConstants = MODEL
     list.push(p.mcap_usd! / p.tvl_usd);
     byCat.set(key, list);
   }
-  const globalMedian = median(live.map((p) => p.mcap_usd! / p.tvl_usd)) ?? 0.25;
+  const allRatios = live.map((p) => p.mcap_usd! / p.tvl_usd);
+  const globalMedian = median(allRatios) ?? 0.25;
+  const globalQ1 = quartile(allRatios, 0.25) ?? globalMedian;
+  const globalQ3 = quartile(allRatios, 0.75) ?? globalMedian;
   const clamp = (m: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, m));
-  const global: CategoryMultiple = { category: 'All live protocols', multiple: clamp(globalMedian), n: live.length, source: 'global' };
+  const global: CategoryMultiple = {
+    category: 'All live protocols',
+    multiple: clamp(globalMedian),
+    n: live.length,
+    source: 'global',
+    q1: clamp(globalQ1),
+    q3: clamp(globalQ3),
+    raw_median: globalMedian,
+  };
   const byCategory = new Map<string, CategoryMultiple>();
   for (const [cat, ratios] of byCat) {
     const med = median(ratios);
     if (med !== null && ratios.length >= model.min_comparables) {
-      byCategory.set(cat, { category: cat, multiple: clamp(med), n: ratios.length, source: 'category' });
+      const shrunk = (ratios.length * med + model.shrink_prior * globalMedian) / (ratios.length + model.shrink_prior);
+      byCategory.set(cat, {
+        category: cat,
+        multiple: clamp(shrunk),
+        n: ratios.length,
+        source: 'category',
+        q1: clamp(quartile(ratios, 0.25) ?? med),
+        q3: clamp(quartile(ratios, 0.75) ?? med),
+        raw_median: med,
+      });
     }
   }
   return { byCategory, global };
@@ -286,13 +362,27 @@ export function multipleFor(p: SnapshotProtocol, multiples: { byCategory: Map<st
   return found ?? multiples.global;
 }
 
-/** The three multipliers and the implied value one protocol gets under `model`. */
+/** The multipliers and the implied value one protocol gets under `model`, with the confidence band.
+ *  The band is the point estimate scaled by the category's own quartile ratios: low uses the first
+ *  quartile over the raw median, high the third quartile over the raw median, so the band always
+ *  brackets the point by construction (low <= implied <= high). When the raw median is zero or the
+ *  quartiles are degenerate the band collapses onto the point instead of dividing by zero. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   multiples: { byCategory: Map<string, CategoryMultiple>; global: CategoryMultiple },
   model: ModelConstants,
-): { implied: number; multiple: CategoryMultiple; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): {
+  implied: number;
+  impliedLow: number;
+  impliedHigh: number;
+  multiple: CategoryMultiple;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  breadthMult: number;
+  age: number | null;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const multiple = multipleFor(protocol, multiples);
   const rawGrowth = finite(protocol.change_7d, 0);
@@ -300,9 +390,16 @@ export function impliedValue(
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const chains = Math.min(Math.max(protocol.chains.length, 1), model.breadth_cap);
+  const breadthMult = 1 + model.breadth_weight * (chains - 1);
   const base = protocol.tvl_usd * multiple.multiple * model.pretoken_discount;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, age };
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
+  const rawMed = multiple.raw_median;
+  const lowRatio = rawMed > 0 ? Math.min(1, multiple.q1 / rawMed) : 1;
+  const highRatio = rawMed > 0 ? Math.max(1, multiple.q3 / rawMed) : 1;
+  const impliedLow = Math.max(1, Math.round(implied * lowRatio));
+  const impliedHigh = Math.max(implied, Math.round(implied * highRatio));
+  return { implied, impliedLow, impliedHigh, multiple, growthPct, growthMult, maturityMult, breadthMult, age };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -324,8 +421,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, multiple, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, multiples, model);
-    return { p, implied, multiple, growthPct, growthMult, maturityMult, age };
+    const { implied, impliedLow, impliedHigh, multiple, growthPct, growthMult, maturityMult, breadthMult, age } = impliedValue(p, snapshot.as_of, multiples, model);
+    return { p, implied, impliedLow, impliedHigh, multiple, growthPct, growthMult, maturityMult, breadthMult, age };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -343,16 +440,21 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    implied_low_usd: s.impliedLow,
+    implied_high_usd: s.impliedHigh,
     model: {
       multiple: s.multiple.multiple,
       multiple_n: s.multiple.n,
       multiple_source: s.multiple.source,
+      multiple_q1: s.multiple.q1,
+      multiple_q3: s.multiple.q3,
       growth_pct: s.growthPct,
       growth_multiplier: s.growthMult,
       maturity_multiplier: s.maturityMult,
+      breadth_multiplier: s.breadthMult,
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, s.impliedHigh / Math.max(s.impliedLow, 1)).map(stepText),
   }));
 }
 
@@ -377,6 +479,16 @@ function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 1_000_000_000) return 150;
   if (p.tvl_usd >= 100_000_000) return 100;
   return 50;
+}
+
+/** How much of that capital to actually deploy, from the width of the confidence band: a wide band
+ *  means the market has not agreed what this kind of protocol is worth, so the position shrinks. A
+ *  band wider than 6x halves the capital; wider than 3x takes a quarter off; a narrow band is full
+ *  size. The ratio is high over low, always at least 1. */
+function capitalScale(bandRatio: number): number {
+  if (bandRatio > 6) return 0.5;
+  if (bandRatio > 3) return 0.75;
+  return 1;
 }
 
 /** How long to hold, from the protocol's age: younger protocols get a longer qualifying window. */
@@ -405,15 +517,19 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
- * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
+ * the protocol's own record (category, chains, TVL, age) and the width of its confidence band, never
+ * from a hand-written list of names. A wide band shrinks the capital: the plan bets less where the
+ * market's own comparables disagree most. The last step is the exit: a farm that never unwinds is a
+ * donation, so the plan takes half out at launch and leaves half for a later snapshot.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, bandRatio = 1): FarmStep[] {
   const chain = chainOf(p);
-  const capital = capitalFor(p);
+  const capital = Math.round(capitalFor(p) * capitalScale(bandRatio));
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   const young = age !== null && age < 180;
+  const sizedDown = capitalScale(bandRatio) < 1;
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
@@ -441,6 +557,18 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes; if it has no points page yet, the position still counts for a future snapshot.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
+    },
+    {
+      text: sizedDown
+        ? `This protocol's value band is wide, so the position is sized down on purpose: the comparables disagree by a factor of ${bandRatio.toFixed(1)}, and a smaller bet is the honest answer to that disagreement.`
+        : `This protocol's value band is narrow, so the comparables mostly agree and the position is full size.`,
+      cost: 'nothing but the sizing decision',
+      time: '5 minutes',
+    },
+    {
+      text: `Unwind in two parts: take half the position out once the token launches and a market exists, and leave the rest for a second snapshot so a later distribution still sees the position.`,
+      cost: 'about $4 of gas to exit',
+      time: '15 minutes to unwind',
     },
     {
       text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
@@ -513,11 +641,16 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    implied_low_usd: row.implied_low_usd,
+    implied_high_usd: row.implied_high_usd,
     multiple: row.model.multiple,
     multiple_n: row.model.multiple_n,
     multiple_source: row.model.multiple_source,
+    multiple_q1: row.model.multiple_q1,
+    multiple_q3: row.model.multiple_q3,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    breadth_multiplier: row.model.breadth_multiplier,
   };
 }
 
@@ -609,6 +742,11 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (steps.length < 3 || steps.length > 12) return `${r.slug} has ${steps.length} farm steps`;
     for (const s of steps) if (s.length < 20 || s.length > 600) return `${r.slug} has a farm step of ${s.length} characters`;
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
+    if (!Number.isSafeInteger(r.implied_low_usd) || r.implied_low_usd <= 0) return `${r.slug} has implied low ${r.implied_low_usd}`;
+    if (!Number.isSafeInteger(r.implied_high_usd) || r.implied_high_usd <= 0) return `${r.slug} has implied high ${r.implied_high_usd}`;
+    if (r.implied_low_usd > r.implied_value_usd || r.implied_high_usd < r.implied_value_usd) {
+      return `${r.slug} has a band that does not bracket its point: low $${r.implied_low_usd}, point $${r.implied_value_usd}, high $${r.implied_high_usd}`;
+    }
   }
   return null;
 }
