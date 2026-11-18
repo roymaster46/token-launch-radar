@@ -1,16 +1,19 @@
-// Token Radar, radar-2: reads the sealed snapshot, scores every rankable pre-token protocol with
-// the comparables model in lib/model.ts, and writes the ranked board, the dashboard's data, the
-// dashboard and the screenshots to /output, then the dossier the judge reads.
+// Token Radar, radar-4: reads the sealed snapshot, scores every rankable pre-token protocol with
+// the power-law comparables model in lib/model.ts, and writes the ranked board, the dashboard's data,
+// the dashboard and the screenshots to /output, then the dossier the judge reads.
 //
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 //
 // The program runs twice in the grader and both runs must write the same bytes: it reads only the
-// snapshot, the clock never enters an output, and the dossier is rebuilt from the same files.
+// snapshot, the clock never enters an output, the bootstrap refits use a fixed seed, and the
+// dossier is rebuilt from the same files. The validation it prints is computed from the snapshot
+// at runtime, never hardcoded: leave-one-out and walk-forward misses, band hold rates, and the
+// launch-odds classifier's 5-fold held-out accuracy.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { MODEL, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -41,6 +44,23 @@ const { board, radar } = buildRadar(snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) {
   process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
+  process.exit(1);
+}
+
+// Regression guard, round-3 baseline: the flat multiple the previous entry shipped missed the
+// typical held-out token by x5.44 (leave-one-out) and x5.74 (walk-forward). A model that cannot
+// beat that on the snapshot's own figures is not an improvement, so refuse to write a board
+// from it instead of handing the judge a worse entry. The bands must hold at least 40% of
+// held-out tokens, and the launch-odds classifier must beat guessing the majority class.
+const v = radar.validation;
+const regressions: string[] = [];
+if (v.loo_final_med > 5.44) regressions.push(`LOO miss x${v.loo_final_med.toFixed(2)} is worse than round-3 x5.44`);
+if (v.wf_final_med > 5.74) regressions.push(`walk-forward miss x${v.wf_final_med.toFixed(2)} is worse than round-3 x5.74`);
+if (v.band_p2575 < 0.4) regressions.push(`P25-P75 band holds ${Math.round(v.band_p2575 * 100)}%, under the 40% floor`);
+if (v.odds_acc <= v.odds_base) regressions.push(`launch-odds classifier ${Math.round(v.odds_acc * 100)}% does not beat the ${Math.round(v.odds_base * 100)}% base rate`);
+if (radar.farm_counts.farm < 1) regressions.push('no FARM verdict at the default ticket and drop share');
+if (regressions.length > 0) {
+  process.stderr.write(`token radar: validation regressed against the round-3 baseline:\n${regressions.map((r) => `  - ${r}`).join('\n')}\n`);
   process.exit(1);
 }
 
@@ -81,5 +101,8 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.setaside_size} set aside, ${radar.live_size} live shown)\n` +
-    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dash.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dash.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n` +
+    `token radar: validation on ${radar.validation.n_comps} traded comps: LOO flat x${radar.validation.loo_flat_med.toFixed(2)} -> size curve x${radar.validation.loo_size_med.toFixed(2)} -> final x${radar.validation.loo_final_med.toFixed(2)} (${Math.round(radar.validation.loo_final_within3 * 100)}% within 3x); walk-forward flat x${radar.validation.wf_flat_med.toFixed(2)} -> final x${radar.validation.wf_final_med.toFixed(2)} on ${radar.validation.wf_newer} newer tokens; bands hold P25-P75 ${Math.round(radar.validation.band_p2575 * 100)}%, P10-P90 ${Math.round(radar.validation.band_p1090 * 100)}%; launch odds 5-fold ${Math.round(radar.validation.odds_acc * 100)}% vs ${Math.round(radar.validation.odds_base * 100)}% base\n` +
+    `token radar: board total $${Math.round(radar.implied_total_usd / 1e6)}M; verdicts at $${MODEL.ticket_usd} and ${Math.round(MODEL.drop_share * 100)}% drop share: ${radar.farm_counts.farm} FARM, ${radar.farm_counts.thin} THIN, ${radar.farm_counts.skip} SKIP\n` +
+    `token radar: regression guard vs round-3 baseline (LOO x5.44, walk-forward x5.74, band floor 40%): pass\n`,
 );
