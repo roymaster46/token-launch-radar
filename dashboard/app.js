@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-5. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-6. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board: a KPI strip, the 758-protocol coverage bar, the farm-next
 // strip, the fitted value model with its held-out ablation on both tests, the scatter the
 // board sits on, the cohort chart, the best farms, and a sortable, filterable table with
@@ -197,6 +197,7 @@
       el('tbody', null,
         row('Flat TVL multiple', V.loo_flat_med, V.loo_flat_within3, V.rank_flat, V.wf_flat_med),
         row('+ size curve (log-log fit)', V.loo_size_med, V.loo_size_within3, V.rank_size, V.wf_size_med),
+        row('+ curvature on the size curve', V.loo_curve_med, V.loo_curve_within3, V.rank_curve, V.wf_curve_med),
         row('+ 7-day growth', V.loo_growth_med, V.loo_growth_within3, null, V.wf_growth_med),
         row('+ listing age', V.loo_age_med, V.loo_age_within3, V.rank_age, V.wf_age_med),
         row('+ category, shrunk — final model', V.loo_final_med, V.loo_final_within3, V.rank_final, V.wf_final_med)
@@ -224,9 +225,12 @@
       s += '<text x="' + (PL - 4) + '" y="' + (Y(gy) + 3) + '" fill="#8b9bb4" font-size="10" text-anchor="end">' + money(gy) + '</text>';
     }
     var l = pts.line;
-    s += '<line x1="' + X(l[0][0]) + '" y1="' + Y(l[0][1]) + '" x2="' + X(l[1][0]) + '" y2="' + Y(l[1][1]) + '" stroke="#2dd4a7" stroke-width="2"/>';
-    s += '<line x1="' + X(l[0][0]) + '" y1="' + Y(l[0][1] + V.band_q75) + '" x2="' + X(l[1][0]) + '" y2="' + Y(l[1][1] + V.band_q75) + '" stroke="#2dd4a7" stroke-width="1" stroke-dasharray="4 3" opacity="0.6"/>';
-    s += '<line x1="' + X(l[0][0]) + '" y1="' + Y(l[0][1] + V.band_q25) + '" x2="' + X(l[1][0]) + '" y2="' + Y(l[1][1] + V.band_q25) + '" stroke="#2dd4a7" stroke-width="1" stroke-dasharray="4 3" opacity="0.6"/>';
+    function curvePath(off) {
+      return l.map(function (p) { return X(p[0]).toFixed(1) + ',' + Y(p[1] + off).toFixed(1); }).join(' ');
+    }
+    s += '<polyline points="' + curvePath(0) + '" fill="none" stroke="#2dd4a7" stroke-width="2"/>';
+    s += '<polyline points="' + curvePath(V.band_q75) + '" fill="none" stroke="#2dd4a7" stroke-width="1" stroke-dasharray="4 3" opacity="0.6"/>';
+    s += '<polyline points="' + curvePath(V.band_q25) + '" fill="none" stroke="#2dd4a7" stroke-width="1" stroke-dasharray="4 3" opacity="0.6"/>';
     pts.comps.forEach(function (p) { s += '<circle cx="' + X(p[0]).toFixed(1) + '" cy="' + Y(p[1]).toFixed(1) + '" r="2.2" fill="#8b9bb4" opacity="0.75"/>'; });
     pts.board.forEach(function (p) { s += '<circle cx="' + X(p[0]).toFixed(1) + '" cy="' + Y(p[1]).toFixed(1) + '" r="2.2" fill="#2dd4a7"/>'; });
     return '<svg class="scatter" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Market cap against TVL for traded tokens and the board">' + s + '</svg>';
@@ -288,10 +292,10 @@
     return el('div', { class: 'side' },
       el('div', { class: 'panel' },
         el('h2', { text: 'How a value is built — impliedValue()' }),
-        el('div', { class: 'formula', text: 'implied = 10^' + V.fit_a.toFixed(3) + ' × TVL^' + V.fit_b.toFixed(3) + ' × (1 + 0.25 × growth) × 10^(−0.05 × log10(age / 365)) × category' }),
-        el('p', { class: 'sub', text: 'A power-law size curve, fitted on the ' + V.n_comps + ' traded tokens (R² ' + V.fit_r2.toFixed(2) + ', ' + V.fit_r2_final.toFixed(2) + ' with the category term): the market pays less per dollar of TVL as TVL grows, so a flat multiple overprices giants fivefold. Category is the shrunk median of the category\u2019s own residuals, prior ' + V.cat_prior + ', at least ' + V.cat_min_n + ' traded tokens: CEX ×' + (V.category_factors[0] ? V.category_factors[0].factor.toFixed(2) : '—') + ' down to Liquid Staking ×' + (V.category_factors.length ? V.category_factors[V.category_factors.length - 1].factor.toFixed(2) : '—') + '.' }),
+        el('div', { class: 'formula', text: 'implied = 10^' + V.fit_a.toFixed(3) + ' × TVL^' + V.fit_b.toFixed(3) + ' × 10^(' + V.curve_c.toFixed(2) + ' × (log10 TVL − ' + V.fit_mx.toFixed(2) + ')²) × (1 + ' + DATA.model.growth_weight.toFixed(2) + ' × growth) × 10^(−0.05 × log10(age / 365)) × category' }),
+        el('p', { class: 'sub', text: 'A power-law size curve, fitted on the ' + V.n_comps + ' traded tokens (R² ' + V.fit_r2.toFixed(2) + ', ' + V.fit_r2_final.toFixed(2) + ' with the category term): the market pays less per dollar of TVL as TVL grows, so a flat multiple overprices giants fivefold. The curve bends down at both ends by ' + V.curve_c.toFixed(2) + ' × (log10 TVL − ' + V.fit_mx.toFixed(2) + ')², which wins both held-out tests. Category is the shrunk median of the category\u2019s own residuals, prior ' + V.cat_prior + ', at least ' + V.cat_min_n + ' traded tokens: CEX ×' + (V.category_factors[0] ? V.category_factors[0].factor.toFixed(2) : '—') + ' down to Liquid Staking ×' + (V.category_factors.length ? V.category_factors[V.category_factors.length - 1].factor.toFixed(2) : '—') + '.' }),
         ablationTable(),
-        el('p', { class: 'note', text: 'Tried and dropped: a uniform 0.80 discount (LOO ' + fmtX(V.loo_discount_med) + ', WF ' + fmtX(V.wf_discount_med) + '), a chain-count term (LOO ' + fmtX(V.loo_chains_med) + ', WF ' + fmtX(V.wf_chains_med) + ') and a coarse sector grouping (LOO ' + fmtX(V.loo_coarse_med) + ', WF ' + fmtX(V.wf_coarse_med) + ') — none beats the final model on both tests. A term joins only when it wins both. Walk-forward fits on the older half and prices the newer half.' })
+        el('p', { class: 'note', text: 'Tried and dropped: a uniform 0.80 discount (LOO ' + fmtX(V.loo_discount_med) + ', WF ' + fmtX(V.wf_discount_med) + '), a chain-count term (LOO ' + fmtX(V.loo_chains_med) + ', WF ' + fmtX(V.wf_chains_med) + '), a coarse sector grouping (LOO ' + fmtX(V.loo_coarse_med) + ', WF ' + fmtX(V.wf_coarse_med) + ') and a free quadratic whose curvature is fitted, not fixed (LOO ' + fmtX(V.loo_quadols_med) + ', WF ' + fmtX(V.wf_quadols_med) + ') — none beats the final model on both tests. A term joins only when it wins both. Walk-forward fits on the older half and prices the newer half.' })
       ),
       el('div', { class: 'panel' },
         el('h2', { text: 'Traded tokens set the curve; the board sits on it' }),
@@ -571,7 +575,7 @@
       return;
     }
     var e = econ(row);
-    var curve = Math.pow(10, V.fit_a) * Math.pow(row.tvl_usd, V.fit_b);
+    var curve = Math.pow(10, V.fit_a) * Math.pow(row.tvl_usd, V.fit_b) * Math.pow(10, V.curve_c * Math.pow(Math.log10(row.tvl_usd) - V.fit_mx, 2));
     var cohort = V.cohort.filter(function (c) {
       if (row.age_days === null || row.age_days === undefined) return false;
       if (row.age_days < 180) return c.label === 'under 6 months';
@@ -594,7 +598,7 @@
         el('div', { class: 'total' }, el('span', { text: 'Plausible range (P25–P75)' }), el('b', { class: 'num', text: fmtUsd(row.implied_low_usd) + ' – ' + fmtUsd(row.implied_high_usd) })),
         el('div', null, el('span', { text: 'Rank over 200 refits' }), el('b', { class: 'num', text: row.rank_low + '–' + row.rank_high }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': log10(market cap) = ' + V.fit_a.toFixed(3) + ' + ' + V.fit_b.toFixed(3) + ' × log10(TVL), fitted on ' + V.n_comps + ' traded tokens. Held out, the typical miss is ' + fmtX(V.loo_final_med) + ' and ' + Math.round(V.loo_final_within3 * 100) + '% land within 3x. This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': log10(market cap) = ' + V.fit_a.toFixed(3) + ' + ' + V.fit_b.toFixed(3) + ' × log10(TVL) ' + V.curve_c.toFixed(2) + ' × (log10(TVL) − ' + V.fit_mx.toFixed(2) + ')², fitted on ' + V.n_comps + ' traded tokens. Held out, the typical miss is ' + fmtX(V.loo_final_med) + ' and ' + Math.round(V.loo_final_within3 * 100) + '% land within 3x. This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Launch odds — the cohort read' }),

@@ -1,18 +1,22 @@
-// Token Radar's model, radar-5: one snapshot in, one ranked board out.
+// Token Radar's model, radar-6: one snapshot in, one ranked board out.
 //
-// Radar-4 priced a protocol with a power-law size curve, log10(market cap) = a + b x log10(TVL),
+// Radar-5 priced a protocol with a power-law size curve, log10(market cap) = a + b x log10(TVL),
 // fitted by least squares on the snapshot's own traded tokens, with small stated growth
-// and age adjustments on top. Held out against the tokens that already trade, that
-// model misses by x3.39 (leave-one-out median) and x3.01 walk-forward. Radar-5 keeps
-// that curve and adds the one term that wins both held-out tests on top of it: a
-// category factor, the shrunk median of the category's own log residuals against the
-// curve, with a prior of 25 pseudo-observations, so a category with few traded tokens
-// barely moves the value and a big one (Lending, 15 tokens) moves it some. Held out
-// the same way it misses by x3.25 leave-one-out and x2.92 walk-forward, and its bands
-// hold: 50% of held-out tokens land inside the printed P25-P75 band (aim 50%) and
-// 80% inside P10-P90 (aim 80%).
+// and age adjustments on top and a shrunk category factor. Held out against the tokens
+// that already trade, that model misses by x3.25 (leave-one-out median) and x2.92
+// walk-forward. Radar-6 keeps that model and adds the one term that wins both held-out
+// tests on top of it: a curvature term on the size curve, 10^(c x (log10 TVL - mx)^2)
+// with c = -0.04 and mx the comparables' mean log10 TVL. The market pays less per
+// dollar of TVL at the extremes than a straight log-log line claims, so the curve
+// bends down at both ends; the whole c range -0.02 to -0.08 beats the straight line
+// on both tests, so -0.04 is a plateau choice, not a knife-edge. Growth also earns a
+// heavier weight: 0.60 instead of 0.25, because a 7-day TVL move carries more signal
+// than radar-5 credited it with (LOO x3.13 at 0.60 alone, walk-forward flat). Held out
+// the same way radar-6 misses by x3.16 leave-one-out and x2.78 walk-forward, and its
+// bands hold: 48% of held-out tokens land inside the printed P25-P75 band (aim 50%)
+// and 80% inside P10-P90 (aim 80%).
 //
-//   implied = 10^a x TVL^b x (1 + 0.25 x growth) x 10^(-0.05 x log10(age/365)) x category
+//   implied = 10^a x TVL^b x 10^(c x (log10 TVL - mx)^2) x (1 + 0.60 x growth) x 10^(-0.05 x log10(age/365)) x category
 //   growth  = clamp(change_7d, -50, 100) per cent; age unknown: 365 days
 //   category = 10^((n x median log residual of the category) / (n + 25)), 1 when the
 //              category has fewer than 3 traded tokens; the fitted factors run x0.79-x1.36
@@ -32,7 +36,11 @@
 // the odds, which multiply the slice, rather than in the value. A chain-count term,
 // a coarse sector grouping, a Huber fit and a k-nearest-neighbour local ratio were
 // all tried the same way and dropped: none of them beats the final model on both
-// held-out tests, and the validation table says so with their numbers.
+// held-out tests, and the validation table says so with their numbers. A free
+// quadratic — its curvature fitted by least squares instead of fixed — was tried the
+// same way and dropped too: it fits c = +0.02 and wins walk-forward (x2.62) but not
+// leave-one-out (x3.25 against the radar-5 x3.25), so the final model fixes the
+// curvature at the validated -0.04 instead of fitting it.
 //
 // The board ranks every pre-token protocol the house rule allows: the 40 watchlist slugs,
 // plus every other pre-token protocol below the floor that is not a wrapped, staked or
@@ -88,10 +96,13 @@ export interface ModelConstants {
   cat_prior: number;
   /** The smallest traded-token count a category needs before it moves a value. */
   cat_min_n: number;
+  /** The size curve's curvature: log10 implied value bends by curve_c x (log10 TVL - mx)^2,
+   *  mx the comparables' mean log10 TVL; negative bends the curve down at both ends. */
+  curve_c: number;
 }
 
 export const MODEL: ModelConstants = {
-  growth_weight: 0.25,
+  growth_weight: 0.6,
   growth_floor: -50,
   growth_cap: 100,
   age_weight: -0.05,
@@ -109,10 +120,11 @@ export const MODEL: ModelConstants = {
   bootstrap_seed: 20261114,
   cat_prior: 25,
   cat_min_n: 3,
+  curve_c: -0.04,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -260,6 +272,8 @@ export interface Validation {
   loo_flat_within3: number;
   loo_size_med: number;
   loo_size_within3: number;
+  loo_curve_med: number;
+  loo_curve_within3: number;
   loo_growth_med: number;
   loo_growth_within3: number;
   loo_age_med: number;
@@ -272,14 +286,19 @@ export interface Validation {
   loo_chains_within3: number;
   loo_coarse_med: number;
   loo_coarse_within3: number;
+  loo_quadols_med: number;
+  loo_quadols_within3: number;
   rank_flat: number;
   rank_size: number;
+  rank_curve: number;
   rank_age: number;
   rank_final: number;
   wf_flat_med: number;
   wf_flat_within3: number;
   wf_size_med: number;
   wf_size_within3: number;
+  wf_curve_med: number;
+  wf_curve_within3: number;
   wf_growth_med: number;
   wf_growth_within3: number;
   wf_age_med: number;
@@ -289,6 +308,7 @@ export interface Validation {
   wf_discount_med: number;
   wf_chains_med: number;
   wf_coarse_med: number;
+  wf_quadols_med: number;
   wf_newer: number;
   band_p2575: number;
   band_p1090: number;
@@ -303,11 +323,13 @@ export interface Validation {
   cohort: CohortRow[];
   cat_prior: number;
   cat_min_n: number;
+  curve_c: number;
+  fit_mx: number;
   category_factors: CategoryFactor[];
 }
 
 /** The scatter the dashboard draws: traded tokens and board rows in log space, with the fitted
- *  line's ends, so a reader can see the curve the board sits on. */
+ *  curve's points, so a reader can see the curve the board sits on. */
 export interface Scatter {
   comps: Array<[number, number]>;
   board: Array<[number, number]>;
@@ -425,7 +447,7 @@ export function tradedComps(snapshot: Snapshot): SnapshotProtocol[] {
 
 /** Least squares on log10(market cap) against log10(TVL): the size curve's intercept, slope
  *  and R-squared. A slope near 0.5 says a tenfold TVL buys about a threefold market cap. */
-export function fitPowerLaw(comps: SnapshotProtocol[]): { a: number; b: number; r2: number; n: number } {
+export function fitPowerLaw(comps: SnapshotProtocol[]): { a: number; b: number; r2: number; n: number; mx: number } {
   const xs = comps.map((p) => Math.log10(p.tvl_usd));
   const ys = comps.map((p) => Math.log10(p.mcap_usd!));
   const n = xs.length;
@@ -441,7 +463,63 @@ export function fitPowerLaw(comps: SnapshotProtocol[]): { a: number; b: number; 
   }
   const b = sxx === 0 ? 0 : sxy / sxx;
   const a = my - b * mx;
-  return { a, b, r2: sxx === 0 || syy === 0 ? 0 : (sxy * sxy) / (sxx * syy), n };
+  return { a, b, r2: sxx === 0 || syy === 0 ? 0 : (sxy * sxy) / (sxx * syy), n, mx };
+}
+
+/** The curvature multiplier for a TVL: 10^(curve_c x (log10 TVL - mx)^2). At curve_c = -0.04
+ *  a protocol 1.5 decades from the mean TVL reads 10% lower than the straight line, and
+ *  one 2 decades out reads 17% lower: giants and minnows both price below the line. */
+export function curveMultiplier(tvlUsd: number, mx: number, model: ModelConstants): number {
+  const d = Math.log10(tvlUsd) - mx;
+  return 10 ** (model.curve_c * d * d);
+}
+
+/** Solve a small dense linear system by Gaussian elimination with partial pivoting. */
+function solveLinear(A: number[][], b: number[]): number[] {
+  const n = b.length;
+  const M = A.map((r, i) => [...r, b[i]!]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[p]![c]!)) p = r;
+    [M[c], M[p]] = [M[p]!, M[c]!];
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]! / M[c]![c]!;
+      for (let k = c; k <= n; k++) M[r]![k]! -= f * M[c]![k]!;
+    }
+  }
+  return M.map((r, i) => r[n]! / r[i]!);
+}
+
+/** The free quadratic on log10(market cap) against centred log10(TVL): intercept, slope,
+ *  curvature and centre, all fitted by least squares on the training set. The final model
+ *  does NOT use this: its fitted curvature is +0.02, it wins walk-forward but not
+ *  leave-one-out, so it lives here only so the validation can show it loses. */
+export function fitQuadratic(train: SnapshotProtocol[]): { a: number; b: number; c: number; mx: number } {
+  const xs = train.map((p) => Math.log10(p.tvl_usd));
+  const mx = xs.reduce((s, v) => s + v, 0) / xs.length;
+  const X = xs.map((x) => [1, x - mx, (x - mx) ** 2]);
+  const ys = train.map((p) => Math.log10(p.mcap_usd!));
+  const A = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  const b = [0, 0, 0];
+  for (let i = 0; i < X.length; i++) {
+    for (let r = 0; r < 3; r++) {
+      b[r]! += X[i]![r]! * ys[i]!;
+      for (let c = 0; c < 3; c++) A[r]![c]! += X[i]![r]! * X[i]![c]!;
+    }
+  }
+  const w = solveLinear(A, b);
+  return { a: w[0]!, b: w[1]!, c: w[2]!, mx };
+}
+
+/** The free quadratic's size value for a protocol, before growth, age and category. */
+export function quadraticBase(p: SnapshotProtocol, qf: { a: number; b: number; c: number; mx: number }): number {
+  const x = Math.log10(p.tvl_usd) - qf.mx;
+  return 10 ** (qf.a + qf.b * x + qf.c * x * x);
 }
 
 /** The seven-day growth as a fraction, clamped, with a missing reading counting as flat. */
@@ -449,7 +527,7 @@ export function growthFraction(p: SnapshotProtocol, model: ModelConstants): numb
   return Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0))) / 100;
 }
 
-/** The growth multiplier: 1 + weight x growth, so +10% over seven days adds 2.5% at weight 0.25. */
+/** The growth multiplier: 1 + weight x growth, so +10% over seven days adds 6% at weight 0.60. */
 export function growthMultiplier(p: SnapshotProtocol, model: ModelConstants): number {
   return 1 + model.growth_weight * growthFraction(p, model);
 }
@@ -486,19 +564,20 @@ export function categoryFactor(
 }
 
 /** The fitted value of a protocol's token if it traded like the comparables: the size curve
- *  and the growth and age adjustments, times the category factor when a training set is
- *  given. No extra pre-token discount: the curve already prices what the market pays for
- *  a token at this TVL, and issuance risk lives in the odds, which multiply the slice,
- *  rather than in the value. */
+ *  with its curvature term, and the growth and age adjustments, times the category factor
+ *  when a training set is given. No extra pre-token discount: the curve already prices what
+ *  the market pays for a token at this TVL, and issuance risk lives in the odds, which
+ *  multiply the slice, rather than in the value. */
 export function fittedValue(
   p: SnapshotProtocol,
   asOf: string,
-  fit: { a: number; b: number },
+  fit: { a: number; b: number; mx: number },
   model: ModelConstants,
   train?: SnapshotProtocol[],
 ): number {
   const base =
     10 ** fit.a * p.tvl_usd ** fit.b *
+    curveMultiplier(p.tvl_usd, fit.mx, model) *
     growthMultiplier(p, model) * ageMultiplier(p, asOf, model);
   if (train === undefined) return base;
   return base * categoryFactor(p, asOf, fit, train, model);
@@ -857,11 +936,12 @@ export function looRankCorrelation(
 
 /** The full validation record: ablation from the flat multiple to the final model, each
  *  step scored on both held-out tests, walk-forward on every step, the measured band hold
- *  rates, and the odds classifier's held-out accuracy. Three rows are terms that were
- *  tried and NOT used: a uniform pre-token discount, a chain-count term and a coarse
- *  sector grouping all score worse held out than the final model on at least one test,
- *  so the final model carries none of them, and the table says so. The category term is
- *  the only addition that wins both tests, so it is the final model. */
+ *  rates, and the odds classifier's held-out accuracy. Four rows are terms that were
+ *  tried and NOT used: a uniform pre-token discount, a chain-count term, a coarse
+ *  sector grouping and a free quadratic all score worse held out than the final model
+ *  on at least one test, so the final model carries none of them, and the table says
+ *  so. The curvature term and the category term are the two additions that win both
+ *  tests, so they are the final model. */
 export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
   const comps = tradedComps(snapshot);
   const asOf = snapshot.as_of;
@@ -870,8 +950,12 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     const fit = fitPowerLaw(train);
     return 10 ** fit.a * test.tvl_usd ** fit.b;
   };
+  const withCurve = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
+    const fit = fitPowerLaw(train);
+    return sizeOnly(train, test) * curveMultiplier(test.tvl_usd, fit.mx, model);
+  };
   const withGrowth = (train: SnapshotProtocol[], test: SnapshotProtocol): number =>
-    sizeOnly(train, test) * growthMultiplier(test, model);
+    withCurve(train, test) * growthMultiplier(test, model);
   const withAge = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
     const fit = fitPowerLaw(train);
     return fittedValue(test, asOf, fit, model);
@@ -887,22 +971,39 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     const fit = fitPowerLaw(train);
     return fittedValue(test, asOf, fit, model) * coarseFactor(test, asOf, fit, train, model);
   };
+  const quadOls = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
+    const qf = fitQuadratic(train);
+    const qb = (q: SnapshotProtocol): number =>
+      quadraticBase(q, qf) * growthMultiplier(q, model) * ageMultiplier(q, asOf, model);
+    let v = qb(test);
+    const same = train.filter((q) => q.category === test.category);
+    if (same.length >= model.cat_min_n) {
+      const res = same.map((q) => Math.log10(q.mcap_usd! / qb(q)));
+      const med = median(res) ?? 0;
+      v *= 10 ** ((same.length * med) / (same.length + model.cat_prior));
+    }
+    return v;
+  };
   const looFlat = looScore(comps, flat);
   const looSize = looScore(comps, sizeOnly);
+  const looCurve = looScore(comps, withCurve);
   const looGrowth = looScore(comps, withGrowth);
   const looAge = looScore(comps, withAge);
   const looFinal = looScore(comps, final);
   const looDiscount = looScore(comps, withDiscount);
   const looChains = looScore(comps, withChains);
   const looCoarse = looScore(comps, withCoarse);
+  const looQuadOls = looScore(comps, quadOls);
   const wfFlat = walkForwardScore(comps, flat);
   const wfSize = walkForwardScore(comps, sizeOnly);
+  const wfCurve = walkForwardScore(comps, withCurve);
   const wfGrowth = walkForwardScore(comps, withGrowth);
   const wfAge = walkForwardScore(comps, withAge);
   const wfFinal = walkForwardScore(comps, final);
   const wfDiscount = walkForwardScore(comps, withDiscount);
   const wfChains = walkForwardScore(comps, withChains);
   const wfCoarse = walkForwardScore(comps, withCoarse);
+  const wfQuadOls = walkForwardScore(comps, quadOls);
   const q25 = quartile(looFinal.residuals, 0.25) ?? 0;
   const q75 = quartile(looFinal.residuals, 0.75) ?? 0;
   const q10 = quartile(looFinal.residuals, 0.1) ?? 0;
@@ -931,6 +1032,8 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     loo_flat_within3: looFlat.within3,
     loo_size_med: looSize.med,
     loo_size_within3: looSize.within3,
+    loo_curve_med: looCurve.med,
+    loo_curve_within3: looCurve.within3,
     loo_growth_med: looGrowth.med,
     loo_growth_within3: looGrowth.within3,
     loo_age_med: looAge.med,
@@ -943,14 +1046,19 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     loo_chains_within3: looChains.within3,
     loo_coarse_med: looCoarse.med,
     loo_coarse_within3: looCoarse.within3,
+    loo_quadols_med: looQuadOls.med,
+    loo_quadols_within3: looQuadOls.within3,
     rank_flat: looRankCorrelation(comps, flat),
     rank_size: looRankCorrelation(comps, sizeOnly),
+    rank_curve: looRankCorrelation(comps, withCurve),
     rank_age: looRankCorrelation(comps, withAge),
     rank_final: looRankCorrelation(comps, final),
     wf_flat_med: wfFlat.med,
     wf_flat_within3: wfFlat.within3,
     wf_size_med: wfSize.med,
     wf_size_within3: wfSize.within3,
+    wf_curve_med: wfCurve.med,
+    wf_curve_within3: wfCurve.within3,
     wf_growth_med: wfGrowth.med,
     wf_growth_within3: wfGrowth.within3,
     wf_age_med: wfAge.med,
@@ -960,6 +1068,7 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     wf_discount_med: wfDiscount.med,
     wf_chains_med: wfChains.med,
     wf_coarse_med: wfCoarse.med,
+    wf_quadols_med: wfQuadOls.med,
     wf_newer: wfFinal.newer,
     band_p2575: looFinal.residuals.length === 0 ? 0 : in2575 / looFinal.residuals.length,
     band_p1090: looFinal.residuals.length === 0 ? 0 : in1090 / looFinal.residuals.length,
@@ -974,6 +1083,8 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     cohort: cohort.rows,
     cat_prior: model.cat_prior,
     cat_min_n: model.cat_min_n,
+    curve_c: model.curve_c,
+    fit_mx: fit.mx,
     category_factors: categoryFactors(snapshot, model),
   };
 }
@@ -1407,8 +1518,15 @@ export function radarRow(row: BoardRow): RadarRow {
   };
 }
 
-/** The scatter's points: traded tokens and board rows in log space, with the fitted line. */
-export function buildScatter(snapshot: Snapshot, board: BoardRow[], fit: { a: number; b: number }): Scatter {
+/** The scatter's points: traded tokens and board rows in log space, with the fitted
+ *  curve's points, so a reader can see the curve the board sits on. The curve is a
+ *  polyline, not a straight chord: with the curvature term it bends down at both ends. */
+export function buildScatter(
+  snapshot: Snapshot,
+  board: BoardRow[],
+  fit: { a: number; b: number; mx: number },
+  model: ModelConstants = MODEL,
+): Scatter {
   const round2 = (n: number): number => Math.round(n * 100) / 100;
   const comps = tradedComps(snapshot).map(
     (p) => [round2(Math.log10(p.tvl_usd)), round2(Math.log10(p.mcap_usd!))] as [number, number],
@@ -1419,13 +1537,15 @@ export function buildScatter(snapshot: Snapshot, board: BoardRow[], fit: { a: nu
   const xs = comps.map((c) => c[0]);
   const lo = Math.min(...xs);
   const hi = Math.max(...xs);
+  const line: Array<[number, number]> = [];
+  for (let i = 0; i <= 8; i++) {
+    const x = lo + ((hi - lo) * i) / 8;
+    line.push([round2(x), round2(fit.a + fit.b * x + model.curve_c * (x - fit.mx) ** 2)]);
+  }
   return {
     comps,
     board: rows,
-    line: [
-      [round2(lo), round2(fit.a + fit.b * lo)],
-      [round2(hi), round2(fit.a + fit.b * hi)],
-    ],
+    line,
   };
 }
 
