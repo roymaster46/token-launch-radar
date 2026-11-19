@@ -1,4 +1,4 @@
-/* Token Radar's dark theme, radar-4. One palette, two radii, two families; everything else is
+/* Token Radar's dark theme, radar-5. One palette, two radii, two families; everything else is
    spacing, a hairline and a type step. No network: no font import, no image, no remote anything. */
 :root {
   --canvas: #0a0f1a;
@@ -44,6 +44,11 @@ button { cursor: pointer; }
 .kpi b { display: block; font-size: 24px; line-height: 1.2; margin: 2px 0; }
 .kpi b em { font-style: normal; color: var(--accent); }
 .kpi small { display: block; color: var(--muted); font-size: 11px; line-height: 1.35; }
+
+/* Farm-next strip */
+.farmnext { font-size: 13px; }
+.farmnext b { color: var(--accent); }
+.farmnext span { color: var(--ink); }
 
 /* Coverage bar */
 .cover { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-panel); padding: 8px 12px; margin-bottom: 10px; }

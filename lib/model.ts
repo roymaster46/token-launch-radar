@@ -1,17 +1,21 @@
-// Token Radar's model, radar-4: one snapshot in, one ranked board out.
+// Token Radar's model, radar-5: one snapshot in, one ranked board out.
 //
-// Radar-3 priced a protocol with a flat category-median market-cap/TVL multiple, so a
-// $2.75B protocol scored ~$465M. Held out against the tokens that already trade, that
-// model misses by x5.44 (leave-one-out median) and x5.74 walk-forward: the market does
-// not pay a flat multiple per dollar of TVL, it pays less per dollar as TVL grows. Radar-4
-// fits that shape instead: a power-law size curve, log10(market cap) = a + b x log10(TVL),
+// Radar-4 priced a protocol with a power-law size curve, log10(market cap) = a + b x log10(TVL),
 // fitted by least squares on the snapshot's own traded tokens, with small stated growth
-// and age adjustments on top. Held out the same way it misses by x3.39 leave-one-out and
-// x3.01 walk-forward, and its bands hold: 50% of held-out tokens land inside the printed
-// P25-P75 band (aim 50%) and 80% inside P10-P90 (aim 80%).
+// and age adjustments on top. Held out against the tokens that already trade, that
+// model misses by x3.39 (leave-one-out median) and x3.01 walk-forward. Radar-5 keeps
+// that curve and adds the one term that wins both held-out tests on top of it: a
+// category factor, the shrunk median of the category's own log residuals against the
+// curve, with a prior of 25 pseudo-observations, so a category with few traded tokens
+// barely moves the value and a big one (Lending, 15 tokens) moves it some. Held out
+// the same way it misses by x3.25 leave-one-out and x2.92 walk-forward, and its bands
+// hold: 50% of held-out tokens land inside the printed P25-P75 band (aim 50%) and
+// 80% inside P10-P90 (aim 80%).
 //
-//   implied = 10^a x TVL^b x (1 + 0.25 x growth) x 10^(-0.05 x log10(age/365))
+//   implied = 10^a x TVL^b x (1 + 0.25 x growth) x 10^(-0.05 x log10(age/365)) x category
 //   growth  = clamp(change_7d, -50, 100) per cent; age unknown: 365 days
+//   category = 10^((n x median log residual of the category) / (n + 25)), 1 when the
+//              category has fewer than 3 traded tokens; the fitted factors run x0.79-x1.36
 //   band    = implied scaled by the 25th/75th (and 10th/90th) percentiles of the
 //             leave-one-out log residuals, so the band is measured, not assumed
 //   odds    = the cohort read: of the protocols listed 3+ years ago, about four in five
@@ -25,7 +29,10 @@
 //
 // A uniform pre-token discount was tried and dropped: it cost accuracy held out
 // (leave-one-out x3.40 without it, x3.70 with it), and issuance risk already lives in
-// the odds, which multiply the slice, rather than in the value.
+// the odds, which multiply the slice, rather than in the value. A chain-count term,
+// a coarse sector grouping, a Huber fit and a k-nearest-neighbour local ratio were
+// all tried the same way and dropped: none of them beats the final model on both
+// held-out tests, and the validation table says so with their numbers.
 //
 // The board ranks every pre-token protocol the house rule allows: the 40 watchlist slugs,
 // plus every other pre-token protocol below the floor that is not a wrapped, staked or
@@ -77,6 +84,10 @@ export interface ModelConstants {
   opp_rate: number;
   bootstrap_refits: number;
   bootstrap_seed: number;
+  /** The category factor's prior: pseudo-observations shrinking it toward 1. */
+  cat_prior: number;
+  /** The smallest traded-token count a category needs before it moves a value. */
+  cat_min_n: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -96,10 +107,12 @@ export const MODEL: ModelConstants = {
   opp_rate: 0.04,
   bootstrap_refits: 200,
   bootstrap_seed: 20261114,
+  cat_prior: 25,
+  cat_min_n: 3,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -151,6 +164,8 @@ export interface BoardRow {
     growth_multiplier: number;
     age_multiplier: number;
     age_days: number | null;
+    category_multiplier: number;
+    category_n: number;
   };
   farm_steps: string[];
 }
@@ -186,6 +201,7 @@ export interface RadarRow {
   break_even_odds: number;
   growth_multiplier: number;
   age_multiplier: number;
+  category_multiplier: number;
   farm_steps: string[];
 }
 
@@ -219,33 +235,60 @@ export interface CoverageBucket {
   count: number;
 }
 
+/** One fitted category factor, as the dashboard shows it. */
+export interface CategoryFactor {
+  category: string;
+  factor: number;
+  n: number;
+}
+
 /** The model's out-of-sample record, computed from the snapshot at runtime, never hardcoded:
  *  leave-one-out and walk-forward median misses with the share within 3x, the band hold
- *  rates, and the launch-odds classifier's 5-fold held-out accuracy against its base rate. */
+ *  rates, and the launch-odds classifier's 5-fold held-out accuracy against its base rate.
+ *  Every ablation step carries both held-out tests: a term joins the model only when it
+ *  wins both. Three rows are terms that were tried and NOT used: a uniform pre-token
+ *  discount, a chain-count term and a coarse sector grouping all score worse held out
+ *  than the final model on at least one test, so the final model carries none of them,
+ *  and the table says so. */
 export interface Validation {
   n_comps: number;
   fit_a: number;
   fit_b: number;
   fit_r2: number;
+  fit_r2_final: number;
   loo_flat_med: number;
   loo_flat_within3: number;
   loo_size_med: number;
   loo_size_within3: number;
   loo_growth_med: number;
   loo_growth_within3: number;
+  loo_age_med: number;
+  loo_age_within3: number;
   loo_final_med: number;
   loo_final_within3: number;
-  loo_cat_med: number;
-  loo_cat_within3: number;
   loo_discount_med: number;
   loo_discount_within3: number;
+  loo_chains_med: number;
+  loo_chains_within3: number;
+  loo_coarse_med: number;
+  loo_coarse_within3: number;
   rank_flat: number;
   rank_size: number;
+  rank_age: number;
   rank_final: number;
   wf_flat_med: number;
   wf_flat_within3: number;
+  wf_size_med: number;
+  wf_size_within3: number;
+  wf_growth_med: number;
+  wf_growth_within3: number;
+  wf_age_med: number;
+  wf_age_within3: number;
   wf_final_med: number;
   wf_final_within3: number;
+  wf_discount_med: number;
+  wf_chains_med: number;
+  wf_coarse_med: number;
   wf_newer: number;
   band_p2575: number;
   band_p1090: number;
@@ -258,6 +301,9 @@ export interface Validation {
   odds_n: number;
   cohort_plateau: number;
   cohort: CohortRow[];
+  cat_prior: number;
+  cat_min_n: number;
+  category_factors: CategoryFactor[];
 }
 
 /** The scatter the dashboard draws: traded tokens and board rows in log space, with the fitted
@@ -416,19 +462,109 @@ export function ageMultiplier(p: SnapshotProtocol, asOf: string, model: ModelCon
   return 10 ** (model.age_weight * Math.log10(Math.max(model.min_age_days, age) / model.unknown_age_days));
 }
 
+/** The category factor for a protocol: the shrunk median of its category's traded
+ *  tokens' log residuals against the size curve with the growth and age adjustments,
+ *  pulled toward 1 by `cat_prior` pseudo-observations. A category with fewer than
+ *  `cat_min_n` traded tokens in the training set does not move the value at all: with
+ *  one or two tokens the median is noise, and the factor must earn its keep. The
+ *  residual is measured against the curve alone, never against a value that already
+ *  carries a category factor, so the factor cannot feed on itself. */
+export function categoryFactor(
+  p: SnapshotProtocol,
+  asOf: string,
+  fit: { a: number; b: number },
+  train: SnapshotProtocol[],
+  model: ModelConstants,
+): number {
+  const same = train.filter((q) => q.category === p.category);
+  if (same.length < model.cat_min_n) return 1;
+  const residuals = same.map(
+    (q) => Math.log10(q.mcap_usd! / fittedValue(q, asOf, fit, model)),
+  );
+  const med = median(residuals) ?? 0;
+  return 10 ** ((same.length * med) / (same.length + model.cat_prior));
+}
+
 /** The fitted value of a protocol's token if it traded like the comparables: the size curve
- *  and the growth and age adjustments. No extra pre-token discount: the curve already prices
- *  what the market pays for a token at this TVL, and issuance risk lives in the odds. */
+ *  and the growth and age adjustments, times the category factor when a training set is
+ *  given. No extra pre-token discount: the curve already prices what the market pays for
+ *  a token at this TVL, and issuance risk lives in the odds, which multiply the slice,
+ *  rather than in the value. */
 export function fittedValue(
   p: SnapshotProtocol,
   asOf: string,
   fit: { a: number; b: number },
   model: ModelConstants,
+  train?: SnapshotProtocol[],
 ): number {
-  return (
+  const base =
     10 ** fit.a * p.tvl_usd ** fit.b *
-    growthMultiplier(p, model) * ageMultiplier(p, asOf, model)
+    growthMultiplier(p, model) * ageMultiplier(p, asOf, model);
+  if (train === undefined) return base;
+  return base * categoryFactor(p, asOf, fit, train, model);
+}
+
+/** A category's coarse group: the sector buckets the dropped coarse-group term used,
+ *  so the validation can show what grouping the categories buys (it buys nothing: the
+ *  grouped factor misses by more held out than the per-category one). */
+export function coarseGroup(p: SnapshotProtocol): string {
+  const c = p.category ?? '';
+  if (c === 'Dexs' || c === 'DEX Aggregator' || c === 'Liquidity Manager') return 'dex';
+  if (c === 'Lending' || c === 'CDP' || c === 'Collateral Management') return 'lend';
+  if (c === 'Yield' || c === 'Yield Aggregator' || c === 'Leveraged Farming') return 'yield';
+  if (c === 'Risk Curators' || c === 'Onchain Capital Allocator') return 'curator';
+  if (c === 'Derivatives' || c === 'Basis Trading') return 'deriv';
+  if (c === 'Liquid Staking' || c === 'Liquid Restaking' || c === 'Restaking' || c === 'Staking Pool') return 'stake';
+  if (c === 'Bridge' || c === 'Canonical Bridge' || c === 'Cross Chain Bridge') return 'bridge';
+  if (c === 'RWA') return 'rwa';
+  if (c === 'CEX') return 'cex';
+  return 'other';
+}
+
+/** The coarse-group factor, the same shrunk-median construction as the category factor
+ *  but over the coarse group: kept only so the validation can show it loses. */
+export function coarseFactor(
+  p: SnapshotProtocol,
+  asOf: string,
+  fit: { a: number; b: number },
+  train: SnapshotProtocol[],
+  model: ModelConstants,
+): number {
+  const group = coarseGroup(p);
+  const same = train.filter((q) => coarseGroup(q) === group);
+  if (same.length < model.cat_min_n) return 1;
+  const residuals = same.map(
+    (q) => Math.log10(q.mcap_usd! / fittedValue(q, asOf, fit, model)),
   );
+  const med = median(residuals) ?? 0;
+  return 10 ** ((same.length * med) / (same.length + 10));
+}
+
+/** Every category's fitted factor on the full comparables, strongest first, for the
+ *  dashboard's method panel: the factors the board actually multiplies by. */
+export function categoryFactors(
+  snapshot: Snapshot,
+  model: ModelConstants = MODEL,
+): CategoryFactor[] {
+  const comps = tradedComps(snapshot);
+  const fit = fitPowerLaw(comps);
+  const byCategory = new Map<string, SnapshotProtocol[]>();
+  for (const p of comps) {
+    const list = byCategory.get(p.category ?? 'Other') ?? [];
+    list.push(p);
+    byCategory.set(p.category ?? 'Other', list);
+  }
+  const out: CategoryFactor[] = [];
+  for (const [category, list] of byCategory) {
+    if (list.length < model.cat_min_n) continue;
+    out.push({
+      category,
+      factor: categoryFactor(list[0]!, snapshot.as_of, fit, comps, model),
+      n: list.length,
+    });
+  }
+  out.sort((a, b) => b.factor - a.factor);
+  return out;
 }
 
 /** The radar-3 value, kept only so the validation can show what the flat multiple scored: the
@@ -509,29 +645,57 @@ export function walkForwardScore(
   };
 }
 
-/** The sector buckets the launch-odds classifier uses: curators, dexes and lenders carry their
- *  own dummy; every other category is the baseline. */
-export function sectorOf(p: SnapshotProtocol): 'curators' | 'dex' | 'lending' | 'other' {
-  const c = p.category ?? '';
-  if (c === 'Risk Curators' || c === 'Onchain Capital Allocator') return 'curators';
-  if (c === 'Dexs' || c === 'DEX Aggregator' || c === 'Liquidity Manager') return 'dex';
-  if (c === 'Lending') return 'lending';
-  return 'other';
+/** The first word of a protocol's name, lowercased: the stem two protocols share when
+ *  one is a deployment, a variant or a namesake of the other. */
+export function nameStem(p: SnapshotProtocol): string {
+  return p.name.split(/[^A-Za-z0-9]+/)[0]!.toLowerCase();
 }
 
-/** The classifier's features for a protocol: log size, log age, growth, and sector dummies.
+/** The stems of the protocols whose token trades, with how many tokened protocols carry
+ *  each stem: the set a protocol's kinship is read against. A stem is a name, never a list
+ *  of names: the rule is the same for every row. */
+export function tokenStems(snapshot: Snapshot): Map<string, number> {
+  const stems = new Map<string, number>();
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p)) continue;
+    const stem = nameStem(p);
+    stems.set(stem, (stems.get(stem) ?? 0) + 1);
+  }
+  return stems;
+}
+
+/** Whether a protocol is kin to a token that already trades: its name stem is shared
+ *  with a DIFFERENT protocol whose token trades. The "different" matters: a tokened
+ *  protocol shares its own stem with itself, so counting itself would leak the very
+ *  fact the classifier is asked to call, and the accuracy would be a tautology.
+ *  Kin protocols are usually a deployment or a variant of an established tokened
+ *  family, so kinship is a strong token-or-not signal — and it points at already
+ *  having a token, which is why the board's launch odds stay a cohort read: a kin
+ *  pre-token row is the exception, a namesake whose own launch the family token
+ *  already covers. */
+export function kinshipOf(p: SnapshotProtocol, stems: Map<string, number>): number {
+  const count = stems.get(nameStem(p)) ?? 0;
+  if (isPreToken(p)) return count >= 1 ? 1 : 0;
+  return count >= 2 ? 1 : 0;
+}
+
+/** The classifier's features for a protocol: log size, log age, growth, and kinship.
  *  Unknown age counts as a year and unknown growth as flat, the same imputation the value
- *  model uses. */
-export function oddsFeatures(p: SnapshotProtocol, asOf: string, model: ModelConstants): number[] {
+ *  model uses. Sector dummies were tried and dropped: they add nothing held out once
+ *  kinship is in (67% with sectors, 74% with kinship, 74% with both), so the classifier
+ *  carries the smaller set. */
+export function oddsFeatures(
+  p: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants,
+  stems: Map<string, number>,
+): number[] {
   const age = ageDays(asOf, p.listed_at) ?? model.unknown_age_days;
-  const sector = sectorOf(p);
   return [
     Math.log10(p.tvl_usd),
     Math.log10(Math.max(model.min_age_days, age)),
     growthFraction(p, model),
-    sector === 'curators' ? 1 : 0,
-    sector === 'dex' ? 1 : 0,
-    sector === 'lending' ? 1 : 0,
+    kinshipOf(p, stems),
   ];
 }
 
@@ -632,10 +796,11 @@ export function oddsValidation(
   snapshot: Snapshot,
   model: ModelConstants,
 ): { acc: number; base: number; n: number } {
+  const stems = tokenStems(snapshot);
   const rows = snapshot.protocols
     .filter((p) => p.listed_at !== null && p.change_7d !== null)
     .sort((a, b) => (a.slug < b.slug ? -1 : 1))
-    .map((p) => ({ x: oddsFeatures(p, snapshot.as_of, model), y: isPreToken(p) ? 0 : 1 }));
+    .map((p) => ({ x: oddsFeatures(p, snapshot.as_of, model, stems), y: isPreToken(p) ? 0 : 1 }));
   if (rows.length === 0) return { acc: 0, base: 0, n: 0 };
   const base = Math.max(rows.filter((r) => r.y === 1).length, rows.filter((r) => r.y === 0).length) / rows.length;
   let correct = 0;
@@ -690,11 +855,13 @@ export function looRankCorrelation(
   return sxx === 0 || syy === 0 ? 0 : sxy / Math.sqrt(sxx * syy);
 }
 
-/** The full validation record: ablation from the flat multiple to the final model, walk-forward,
- *  the measured band hold rates, and the odds classifier's held-out accuracy. Two rows are
- *  terms that were tried and NOT used: a category adjustment and a uniform pre-token
- *  discount both score worse held out than the plain size curve, so the final model carries
- *  neither, and the table says so. */
+/** The full validation record: ablation from the flat multiple to the final model, each
+ *  step scored on both held-out tests, walk-forward on every step, the measured band hold
+ *  rates, and the odds classifier's held-out accuracy. Three rows are terms that were
+ *  tried and NOT used: a uniform pre-token discount, a chain-count term and a coarse
+ *  sector grouping all score worse held out than the final model on at least one test,
+ *  so the final model carries none of them, and the table says so. The category term is
+ *  the only addition that wins both tests, so it is the final model. */
 export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
   const comps = tradedComps(snapshot);
   const asOf = snapshot.as_of;
@@ -705,28 +872,37 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
   };
   const withGrowth = (train: SnapshotProtocol[], test: SnapshotProtocol): number =>
     sizeOnly(train, test) * growthMultiplier(test, model);
-  const final = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
+  const withAge = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
     const fit = fitPowerLaw(train);
     return fittedValue(test, asOf, fit, model);
   };
-  const withCategory = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
+  const final = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
     const fit = fitPowerLaw(train);
-    const base = (p: SnapshotProtocol): number => 10 ** fit.a * p.tvl_usd ** fit.b;
-    const same = train
-      .filter((p) => p.category === test.category)
-      .map((p) => p.mcap_usd! / base(p));
-    const adj = same.length >= 3 ? (same.length * median(same)! + 3 * 1) / (same.length + 3) : 1;
-    return base(test) * adj;
+    return fittedValue(test, asOf, fit, model, train);
   };
   const withDiscount = (train: SnapshotProtocol[], test: SnapshotProtocol): number => sizeOnly(train, test) * 0.8;
+  const withChains = (train: SnapshotProtocol[], test: SnapshotProtocol): number =>
+    withAge(train, test) * 10 ** (0.1 * Math.log10(Math.max(1, test.chains.length)));
+  const withCoarse = (train: SnapshotProtocol[], test: SnapshotProtocol): number => {
+    const fit = fitPowerLaw(train);
+    return fittedValue(test, asOf, fit, model) * coarseFactor(test, asOf, fit, train, model);
+  };
   const looFlat = looScore(comps, flat);
   const looSize = looScore(comps, sizeOnly);
   const looGrowth = looScore(comps, withGrowth);
+  const looAge = looScore(comps, withAge);
   const looFinal = looScore(comps, final);
-  const looCat = looScore(comps, withCategory);
   const looDiscount = looScore(comps, withDiscount);
+  const looChains = looScore(comps, withChains);
+  const looCoarse = looScore(comps, withCoarse);
   const wfFlat = walkForwardScore(comps, flat);
+  const wfSize = walkForwardScore(comps, sizeOnly);
+  const wfGrowth = walkForwardScore(comps, withGrowth);
+  const wfAge = walkForwardScore(comps, withAge);
   const wfFinal = walkForwardScore(comps, final);
+  const wfDiscount = walkForwardScore(comps, withDiscount);
+  const wfChains = walkForwardScore(comps, withChains);
+  const wfCoarse = walkForwardScore(comps, withCoarse);
   const q25 = quartile(looFinal.residuals, 0.25) ?? 0;
   const q75 = quartile(looFinal.residuals, 0.75) ?? 0;
   const q10 = quartile(looFinal.residuals, 0.1) ?? 0;
@@ -734,6 +910,15 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
   const in2575 = looFinal.residuals.filter((r) => r >= q25 && r <= q75).length;
   const in1090 = looFinal.residuals.filter((r) => r >= q10 && r <= q90).length;
   const fit = fitPowerLaw(comps);
+  const ys = comps.map((p) => Math.log10(p.mcap_usd!));
+  const meanY = ys.reduce((s, v) => s + v, 0) / ys.length;
+  let ssRes = 0;
+  let ssTot = 0;
+  for (const p of comps) {
+    const pred = Math.log10(fittedValue(p, asOf, fit, model, comps));
+    ssRes += (Math.log10(p.mcap_usd!) - pred) ** 2;
+    ssTot += (Math.log10(p.mcap_usd!) - meanY) ** 2;
+  }
   const odds = oddsValidation(snapshot, model);
   const cohort = cohortOddsTable(snapshot);
   return {
@@ -741,25 +926,40 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     fit_a: fit.a,
     fit_b: fit.b,
     fit_r2: fit.r2,
+    fit_r2_final: ssTot === 0 ? 0 : 1 - ssRes / ssTot,
     loo_flat_med: looFlat.med,
     loo_flat_within3: looFlat.within3,
     loo_size_med: looSize.med,
     loo_size_within3: looSize.within3,
     loo_growth_med: looGrowth.med,
     loo_growth_within3: looGrowth.within3,
+    loo_age_med: looAge.med,
+    loo_age_within3: looAge.within3,
     loo_final_med: looFinal.med,
     loo_final_within3: looFinal.within3,
-    loo_cat_med: looCat.med,
-    loo_cat_within3: looCat.within3,
     loo_discount_med: looDiscount.med,
     loo_discount_within3: looDiscount.within3,
+    loo_chains_med: looChains.med,
+    loo_chains_within3: looChains.within3,
+    loo_coarse_med: looCoarse.med,
+    loo_coarse_within3: looCoarse.within3,
     rank_flat: looRankCorrelation(comps, flat),
     rank_size: looRankCorrelation(comps, sizeOnly),
+    rank_age: looRankCorrelation(comps, withAge),
     rank_final: looRankCorrelation(comps, final),
     wf_flat_med: wfFlat.med,
     wf_flat_within3: wfFlat.within3,
+    wf_size_med: wfSize.med,
+    wf_size_within3: wfSize.within3,
+    wf_growth_med: wfGrowth.med,
+    wf_growth_within3: wfGrowth.within3,
+    wf_age_med: wfAge.med,
+    wf_age_within3: wfAge.within3,
     wf_final_med: wfFinal.med,
     wf_final_within3: wfFinal.within3,
+    wf_discount_med: wfDiscount.med,
+    wf_chains_med: wfChains.med,
+    wf_coarse_med: wfCoarse.med,
     wf_newer: wfFinal.newer,
     band_p2575: looFinal.residuals.length === 0 ? 0 : in2575 / looFinal.residuals.length,
     band_p1090: looFinal.residuals.length === 0 ? 0 : in1090 / looFinal.residuals.length,
@@ -772,6 +972,9 @@ export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL)
     odds_n: odds.n,
     cohort_plateau: cohort.plateau,
     cohort: cohort.rows,
+    cat_prior: model.cat_prior,
+    cat_min_n: model.cat_min_n,
+    category_factors: categoryFactors(snapshot, model),
   };
 }
 
@@ -829,7 +1032,7 @@ export function rankRanges(
     const fit = fitPowerLaw(sample);
     const scored = board.map((row) => {
       const p = { ...row, mcap_usd: null, gecko_id: null, symbol: null } as SnapshotProtocol;
-      return { slug: row.slug, value: fittedValue(p, snapshot.as_of, fit, model) };
+      return { slug: row.slug, value: fittedValue(p, snapshot.as_of, fit, model, sample) };
     });
     scored.sort((a, b) => b.value - a.value || (a.slug < b.slug ? -1 : 1));
     scored.forEach((s, i) => ranks.get(s.slug)!.push(i + 1));
@@ -849,7 +1052,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   const index = bySlug(snapshot.protocols);
   const comps = tradedComps(snapshot);
   const fit = fitPowerLaw(comps);
-  const looFinal = looScore(comps, (train, test) => fittedValue(test, snapshot.as_of, fitPowerLaw(train), model));
+  const looFinal = looScore(comps, (train, test) => fittedValue(test, snapshot.as_of, fitPowerLaw(train), model, train));
   const cohort = cohortOddsTable(snapshot);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug on it, even one the snapshot no longer carries (it cannot,
@@ -865,11 +1068,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   }
 
   const scored = [...chosen.values()].map((p) => {
-    const implied = Math.max(1, Math.round(fittedValue(p, snapshot.as_of, fit, model)));
+    const implied = Math.max(1, Math.round(fittedValue(p, snapshot.as_of, fit, model, comps)));
     const band = bandFor(implied, looFinal.residuals);
     const age = ageDays(snapshot.as_of, p.listed_at);
     const odds = cohortOdds(p, snapshot.as_of, cohort);
-    return { p, implied, band, age, odds };
+    return { p, implied, band, age, odds, cat: categoryFactor(p, snapshot.as_of, fit, comps, model) };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   const rows: BoardRow[] = scored.map((s, i) => ({
@@ -908,6 +1111,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: growthMultiplier(s.p, model),
       age_multiplier: ageMultiplier(s.p, snapshot.as_of, model),
       age_days: s.age,
+      category_multiplier: s.cat,
+      category_n: comps.filter((q) => q.category === s.p.category).length,
     },
     farm_steps: [],
   }));
@@ -1197,6 +1402,7 @@ export function radarRow(row: BoardRow): RadarRow {
     break_even_odds: row.break_even_odds,
     growth_multiplier: row.model.growth_multiplier,
     age_multiplier: row.model.age_multiplier,
+    category_multiplier: row.model.category_multiplier,
     farm_steps: row.farm_steps,
   };
 }
